@@ -55,6 +55,13 @@ type Conn struct {
 	lastRdyTimestamp int64
 	lastMsgTimestamp int64
 
+	// generation identifies this connection instance; it is assigned by the
+	// Consumer (monotonically increasing per reconnect) before Connect and
+	// is immutable afterwards. Responses and commands on this connection
+	// are bound to this generation so that stale generations can be
+	// isolated from the state of their replacement.
+	generation uint64
+
 	mtx sync.Mutex
 
 	config *Config
@@ -83,6 +90,10 @@ type Conn struct {
 	wg        sync.WaitGroup
 
 	readLoopRunning int32
+
+	// subscribed ensures the topic/channel subscription is restored
+	// exactly once on this connection generation
+	subscribed int32
 }
 
 // NewConn returns a new Conn instance
@@ -227,6 +238,16 @@ func (c *Conn) Close() error {
 // gracefully closing
 func (c *Conn) IsClosing() bool {
 	return atomic.LoadInt32(&c.closeFlag) == 1
+}
+
+// Generation returns the connection generation assigned by the Consumer.
+//
+// Each (re)connection to an nsqd address is assigned a monotonically
+// increasing generation; responses and commands are bound to the
+// generation of the connection they belong to so that stale generations
+// cannot mutate the state of their replacement.
+func (c *Conn) Generation() uint64 {
+	return c.generation
 }
 
 // RDY returns the current RDY count

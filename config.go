@@ -133,6 +133,17 @@ type Config struct {
 	// Duration between redistributing max-in-flight to connections
 	RDYRedistributeInterval time.Duration `opt:"rdy_redistribute_interval" min:"1ms" max:"5s" default:"5s"`
 
+	// Maximum number of commands that may be queued per nsqd address while
+	// its connection is being re-established (a new connection generation).
+	// Queued commands are flushed when the new generation connects; commands
+	// that cannot be queued fail immediately with ErrReconnectQueueFull.
+	// 0 disables reconnect queuing (legacy behavior: commands against a
+	// closing connection fail immediately with ErrClosing).
+	ReconnectQueueSize int `opt:"reconnect_queue_size" min:"0" max:"10000" default:"64"`
+	// Maximum amount of time a command may wait in the reconnect queue
+	// before it is failed with ErrCommandExpired
+	ReconnectQueueTimeout time.Duration `opt:"reconnect_queue_timeout" min:"1ms" max:"5m" default:"10s"`
+
 	// Identifiers sent to nsqd representing this client
 	// UserAgent is in the spirit of HTTP (default: "<client_library_name>/<version>")
 	ClientID  string `opt:"client_id"` // (defaults: short hostname)

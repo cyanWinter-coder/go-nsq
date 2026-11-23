@@ -22,6 +22,16 @@ var ErrAlreadyConnected = errors.New("already connected")
 // ErrOverMaxInFlight is returned from Consumer if over max-in-flight
 var ErrOverMaxInFlight = errors.New("over configure max-inflight")
 
+// ErrReconnectQueueFull is returned when a command cannot be queued for
+// delivery on the next connection generation because the bounded
+// reconnect queue for that nsqd address is full
+var ErrReconnectQueueFull = errors.New("reconnect queue full")
+
+// ErrCommandExpired is delivered to the waiter of a queued command when
+// the command was not flushed to a new connection generation within
+// the configured reconnect queue timeout
+var ErrCommandExpired = errors.New("command expired waiting for reconnect")
+
 // ErrIdentify is returned from Conn as part of the IDENTIFY handshake
 type ErrIdentify struct {
 	Reason string

@@ -75,6 +75,24 @@ const (
 	resumeFlag
 )
 
+// rdyRetryTimer associates a pending RDY retry timer with the connection
+// generation that scheduled it, so that a closing stale generation only
+// ever stops its own timers
+type rdyRetryTimer struct {
+	generation uint64
+	timer      *time.Timer
+}
+
+// queuedCommand is a command held in the bounded reconnect queue of an
+// nsqd address while its connection is being re-established
+type queuedCommand struct {
+	cmd    *Command
+	isRDY  bool
+	rdy    int64
+	timer  *time.Timer
+	result chan error
+}
+
 // Consumer is a high-level type to consume from NSQ.
 //
 // A Consumer instance is supplied a Handler that will be executed
@@ -91,8 +109,11 @@ type Consumer struct {
 	messagesRequeued uint64
 	totalRdyCount    int64
 	backoffDuration  int64
-	backoffCounter   int32
-	maxInFlight      int32
+	// monotonically increasing counter used to assign a generation to
+	// each new connection (see Conn.generation)
+	connGenerationCounter uint64
+	backoffCounter        int32
+	maxInFlight           int32
 
 	mtx sync.RWMutex
 
@@ -117,10 +138,17 @@ type Consumer struct {
 	incomingMessages chan *Message
 
 	rdyRetryMtx    sync.Mutex
-	rdyRetryTimers map[string]*time.Timer
+	rdyRetryTimers map[string]*rdyRetryTimer
 
 	pendingConnections map[string]*Conn
 	connections        map[string]*Conn
+	// connGenerations tracks the current connection generation per nsqd
+	// address; only callbacks from the current generation may mutate
+	// shared consumer state (guarded by mtx)
+	connGenerations map[string]uint64
+	// reconnectQueues holds commands bound for an nsqd address while its
+	// connection is being re-established (guarded by mtx)
+	reconnectQueues map[string][]*queuedCommand
 
 	nsqdTCPAddrs []string
 
@@ -172,9 +200,11 @@ func NewConsumer(topic string, channel string, config *Config) (*Consumer, error
 
 		incomingMessages: make(chan *Message),
 
-		rdyRetryTimers:     make(map[string]*time.Timer),
+		rdyRetryTimers:     make(map[string]*rdyRetryTimer),
 		pendingConnections: make(map[string]*Conn),
 		connections:        make(map[string]*Conn),
+		connGenerations:    make(map[string]uint64),
+		reconnectQueues:    make(map[string][]*queuedCommand),
 
 		lookupdRecheckChan: make(chan int, 1),
 
@@ -550,9 +580,11 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 
 	atomic.StoreInt32(&r.connectedFlag, 1)
 
+	generation := atomic.AddUint64(&r.connGenerationCounter, 1)
 	conn := NewConn(addr, &r.config, &consumerConnDelegate{r})
+	conn.generation = generation
 	conn.SetLoggerLevel(r.getLogLevel())
-	format := fmt.Sprintf("%3d [%s/%s] (%%s)", r.id, r.topic, r.channel)
+	format := fmt.Sprintf("%3d [%s/%s] #%d (%%s)", r.id, r.topic, r.channel, generation)
 	for index := range r.logger {
 		conn.SetLoggerForLevel(r.logger[index], LogLevel(index), format)
 	}
@@ -592,6 +624,14 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 		}
 	}
 
+	// restore the topic/channel subscription exactly once per connection
+	// generation, even if a stale reconnect attempt races this one
+	if !atomic.CompareAndSwapInt32(&conn.subscribed, 0, 1) {
+		cleanupConnection()
+		return fmt.Errorf("[%s] subscription to %s:%s already restored for generation %d",
+			conn, r.topic, r.channel, generation)
+	}
+
 	cmd := Subscribe(r.topic, r.channel)
 	err = conn.WriteCommand(cmd)
 	if err != nil {
@@ -603,7 +643,15 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 	r.mtx.Lock()
 	delete(r.pendingConnections, addr)
 	r.connections[addr] = conn
+	r.connGenerations[addr] = generation
 	r.mtx.Unlock()
+
+	// the new generation supersedes any pending RDY retry timer
+	// scheduled by a previous generation of this address
+	r.stopStaleRDYRetryTimer(addr, generation)
+
+	// deliver commands that were queued while the connection was down
+	r.flushReconnectQueue(addr, conn)
 
 	// pre-emptive signal to existing connections to lower their RDY count
 	for _, c := range r.conns() {
@@ -629,18 +677,24 @@ func indexOf(n string, h []string) int {
 // `nsqd` address from the list
 func (r *Consumer) DisconnectFromNSQD(addr string) error {
 	r.mtx.Lock()
-	defer r.mtx.Unlock()
 
 	idx := indexOf(addr, r.nsqdTCPAddrs)
 	if idx == -1 {
+		r.mtx.Unlock()
 		return ErrNotConnected
 	}
 
 	// slice delete
 	r.nsqdTCPAddrs = append(r.nsqdTCPAddrs[:idx], r.nsqdTCPAddrs[idx+1:]...)
+	delete(r.connGenerations, addr)
 
 	pendingConn, pendingOk := r.pendingConnections[addr]
 	conn, ok := r.connections[addr]
+
+	r.mtx.Unlock()
+
+	// the address is gone for good; queued commands will never be flushed
+	r.failReconnectQueue(addr, ErrNotConnected)
 
 	if ok {
 		conn.Close()
@@ -689,15 +743,40 @@ func (r *Consumer) onConnMessageRequeued(c *Conn, msg *Message) {
 	atomic.AddUint64(&r.messagesRequeued, 1)
 }
 
+// isCurrentConn reports whether c is the current connection generation
+// for its address. Callbacks from stale generations may only complete
+// their own waiters; they must not mutate shared consumer state.
+func (r *Consumer) isCurrentConn(c *Conn) bool {
+	r.mtx.RLock()
+	defer r.mtx.RUnlock()
+	gen, ok := r.connGenerations[c.String()]
+	return ok && gen == c.generation && r.connections[c.String()] == c
+}
+
 func (r *Consumer) onConnBackoff(c *Conn) {
+	if !r.isCurrentConn(c) {
+		r.log(LogLevelDebug, "(%s) ignoring backoff signal from stale connection generation %d",
+			c.String(), c.generation)
+		return
+	}
 	r.startStopContinueBackoff(c, backoffFlag)
 }
 
 func (r *Consumer) onConnContinue(c *Conn) {
+	if !r.isCurrentConn(c) {
+		r.log(LogLevelDebug, "(%s) ignoring continue signal from stale connection generation %d",
+			c.String(), c.generation)
+		return
+	}
 	r.startStopContinueBackoff(c, continueFlag)
 }
 
 func (r *Consumer) onConnResume(c *Conn) {
+	if !r.isCurrentConn(c) {
+		r.log(LogLevelDebug, "(%s) ignoring resume signal from stale connection generation %d",
+			c.String(), c.generation)
+		return
+	}
 	r.startStopContinueBackoff(c, resumeFlag)
 }
 
@@ -728,22 +807,31 @@ func (r *Consumer) onConnClose(c *Conn) {
 	atomic.AddInt64(&r.totalRdyCount, -rdyCount)
 
 	r.rdyRetryMtx.Lock()
-	if timer, ok := r.rdyRetryTimers[c.String()]; ok {
-		// stop any pending retry of an old RDY update
-		timer.Stop()
+	if t, ok := r.rdyRetryTimers[c.String()]; ok && t.generation == c.generation {
+		// stop any pending retry of an old RDY update, but only if it
+		// belongs to this generation - a newer generation's timer must
+		// survive the close of its predecessor
+		t.timer.Stop()
 		delete(r.rdyRetryTimers, c.String())
 		hasRDYRetryTimer = true
 	}
 	r.rdyRetryMtx.Unlock()
 
 	r.mtx.Lock()
-	delete(r.connections, c.String())
+	// only the current generation may remove itself from the connection
+	// set; a stale generation closing late (its responses already
+	// isolated) must not evict its replacement
+	current := r.connections[c.String()] == c
+	if current {
+		delete(r.connections, c.String())
+		delete(r.connGenerations, c.String())
+	}
 	left := len(r.connections)
 	r.mtx.Unlock()
 
 	r.log(LogLevelWarning, "there are %d connections left alive", left)
 
-	if (hasRDYRetryTimer || rdyCount > 0) &&
+	if current && (hasRDYRetryTimer || rdyCount > 0) &&
 		(int32(left) == r.getMaxInFlight() || r.inBackoff()) {
 		// we're toggling out of (normal) redistribution cases and this conn
 		// had a RDY count...
@@ -758,6 +846,12 @@ func (r *Consumer) onConnClose(c *Conn) {
 		if left == 0 {
 			r.stopHandlers()
 		}
+		return
+	}
+
+	if !current {
+		// a stale generation finished closing; reconnect (if any) is
+		// owned by the close of the current generation
 		return
 	}
 
@@ -776,10 +870,17 @@ func (r *Consumer) onConnClose(c *Conn) {
 		// try to reconnect after a bit
 		go func(addr string) {
 			for {
-				r.log(LogLevelInfo, "(%s) re-connecting in %s", addr, r.config.LookupdPollInterval)
-				time.Sleep(r.config.LookupdPollInterval)
 				if atomic.LoadInt32(&r.stopFlag) == 1 {
-					break
+					return
+				}
+				r.log(LogLevelInfo, "(%s) re-connecting in %s", addr, r.config.LookupdPollInterval)
+				select {
+				case <-time.After(r.config.LookupdPollInterval):
+				case <-r.exitChan:
+					return
+				}
+				if atomic.LoadInt32(&r.stopFlag) == 1 {
+					return
 				}
 				r.mtx.RLock()
 				reconnect := indexOf(addr, r.nsqdTCPAddrs) >= 0
@@ -938,7 +1039,10 @@ exit:
 
 func (r *Consumer) updateRDY(c *Conn, count int64) error {
 	if c.IsClosing() {
-		return ErrClosing
+		// the connection this update targets is going away; carry the
+		// intent into the next connection generation via the bounded
+		// reconnect queue instead of silently dropping it
+		return r.queueRDYForReconnect(c, count)
 	}
 
 	// never exceed the nsqd's configured max RDY count
@@ -948,8 +1052,8 @@ func (r *Consumer) updateRDY(c *Conn, count int64) error {
 
 	// stop any pending retry of an old RDY update
 	r.rdyRetryMtx.Lock()
-	if timer, ok := r.rdyRetryTimers[c.String()]; ok {
-		timer.Stop()
+	if t, ok := r.rdyRetryTimers[c.String()]; ok {
+		t.timer.Stop()
 		delete(r.rdyRetryTimers, c.String())
 	}
 	r.rdyRetryMtx.Unlock()
@@ -967,16 +1071,180 @@ func (r *Consumer) updateRDY(c *Conn, count int64) error {
 			// in order to prevent eternal starvation we reschedule this attempt
 			// (if any other RDY update succeeds this timer will be stopped)
 			r.rdyRetryMtx.Lock()
-			r.rdyRetryTimers[c.String()] = time.AfterFunc(5*time.Second,
-				func() {
-					r.updateRDY(c, count)
-				})
+			r.rdyRetryTimers[c.String()] = &rdyRetryTimer{
+				generation: c.generation,
+				timer: time.AfterFunc(5*time.Second,
+					func() {
+						r.updateRDY(c, count)
+					}),
+			}
 			r.rdyRetryMtx.Unlock()
 		}
 		return ErrOverMaxInFlight
 	}
 
 	return r.sendRDY(c, count)
+}
+
+// queueRDYForReconnect enqueues a positive RDY update addressed at a
+// closing connection for delivery on the next connection generation of
+// the same nsqd address.
+//
+// RDY 0 is not carried over (a new connection always starts at 0) and
+// while backing off RDY state is owned by the backoff machinery, so in
+// those cases the legacy ErrClosing is returned.
+func (r *Consumer) queueRDYForReconnect(c *Conn, count int64) error {
+	if count <= 0 || r.inBackoff() || r.inBackoffTimeout() {
+		return ErrClosing
+	}
+	// never exceed the nsqd's configured max RDY count
+	if count > c.MaxRDY() {
+		count = c.MaxRDY()
+	}
+	_, err := r.queueCommandForAddr(c.String(), Ready(int(count)), true, count)
+	if err != nil {
+		r.log(LogLevelDebug, "(%s) unable to queue RDY %d for reconnect - %s",
+			c.String(), count, err)
+		return err
+	}
+	r.log(LogLevelDebug, "(%s) queued RDY %d for next connection generation",
+		c.String(), count)
+	return nil
+}
+
+// queueCommandForAddr enqueues a command to be delivered when the next
+// connection generation for addr is established.
+//
+// The queue is bounded by Config.ReconnectQueueSize; when full the
+// command fails immediately with ErrReconnectQueueFull. A command that
+// is not flushed within Config.ReconnectQueueTimeout fails its waiter
+// with ErrCommandExpired. The returned channel (buffered, never nil on
+// success) receives exactly one result.
+func (r *Consumer) queueCommandForAddr(addr string, cmd *Command, isRDY bool, rdy int64) (chan error, error) {
+	if atomic.LoadInt32(&r.stopFlag) == 1 {
+		return nil, ErrStopped
+	}
+	if r.config.ReconnectQueueSize <= 0 {
+		return nil, ErrClosing
+	}
+
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+
+	// only queue if the address is still registered, i.e. a reconnect
+	// (and therefore a flush) is actually expected
+	if indexOf(addr, r.nsqdTCPAddrs) == -1 {
+		return nil, ErrNotConnected
+	}
+
+	q := r.reconnectQueues[addr]
+	if len(q) >= r.config.ReconnectQueueSize {
+		return nil, ErrReconnectQueueFull
+	}
+
+	qc := &queuedCommand{
+		cmd:    cmd,
+		isRDY:  isRDY,
+		rdy:    rdy,
+		result: make(chan error, 1),
+	}
+	qc.timer = time.AfterFunc(r.config.ReconnectQueueTimeout,
+		func() {
+			r.expireQueuedCommand(addr, qc)
+		})
+	r.reconnectQueues[addr] = append(q, qc)
+	return qc.result, nil
+}
+
+func (r *Consumer) expireQueuedCommand(addr string, qc *queuedCommand) {
+	r.mtx.Lock()
+	q := r.reconnectQueues[addr]
+	found := false
+	for i, e := range q {
+		if e == qc {
+			r.reconnectQueues[addr] = append(q[:i], q[i+1:]...)
+			found = true
+			break
+		}
+	}
+	if len(r.reconnectQueues[addr]) == 0 {
+		delete(r.reconnectQueues, addr)
+	}
+	r.mtx.Unlock()
+
+	if found {
+		r.log(LogLevelWarning, "(%s) command expired after %s waiting for reconnect: %s",
+			addr, r.config.ReconnectQueueTimeout, qc.cmd)
+		qc.result <- ErrCommandExpired
+	}
+}
+
+// flushReconnectQueue delivers commands queued for addr, in order, on
+// the newly established connection
+func (r *Consumer) flushReconnectQueue(addr string, conn *Conn) {
+	r.mtx.Lock()
+	q := r.reconnectQueues[addr]
+	delete(r.reconnectQueues, addr)
+	r.mtx.Unlock()
+
+	for _, qc := range q {
+		qc.timer.Stop()
+		var err error
+		if qc.isRDY {
+			if r.inBackoff() || r.inBackoffTimeout() {
+				// backoff owns RDY state now; the queued intent is stale
+				err = ErrCommandExpired
+			} else {
+				err = r.sendRDY(conn, qc.rdy)
+			}
+		} else {
+			err = conn.WriteCommand(qc.cmd)
+		}
+		if err != nil {
+			r.log(LogLevelWarning, "(%s) error flushing queued command %s - %s",
+				addr, qc.cmd, err)
+		}
+		qc.result <- err
+	}
+}
+
+// failReconnectQueue fails all commands queued for addr with err
+func (r *Consumer) failReconnectQueue(addr string, err error) {
+	r.mtx.Lock()
+	q := r.reconnectQueues[addr]
+	delete(r.reconnectQueues, addr)
+	r.mtx.Unlock()
+
+	for _, qc := range q {
+		qc.timer.Stop()
+		qc.result <- err
+	}
+}
+
+// failAllReconnectQueues fails every queued command (used on Stop)
+func (r *Consumer) failAllReconnectQueues(err error) {
+	r.mtx.Lock()
+	queues := r.reconnectQueues
+	r.reconnectQueues = make(map[string][]*queuedCommand)
+	r.mtx.Unlock()
+
+	for _, q := range queues {
+		for _, qc := range q {
+			qc.timer.Stop()
+			qc.result <- err
+		}
+	}
+}
+
+// stopStaleRDYRetryTimer stops the pending RDY retry timer for addr if
+// it was scheduled by a different (older) connection generation
+func (r *Consumer) stopStaleRDYRetryTimer(addr string, generation uint64) {
+	r.rdyRetryMtx.Lock()
+	if t, ok := r.rdyRetryTimers[addr]; ok && t.generation != generation {
+		t.timer.Stop()
+		delete(r.rdyRetryTimers, addr)
+	}
+	r.rdyRetryMtx.Unlock()
 }
 
 func (r *Consumer) sendRDY(c *Conn, count int64) error {
@@ -1075,6 +1343,9 @@ func (r *Consumer) Stop() {
 	}
 
 	r.log(LogLevelInfo, "stopping...")
+
+	// no new generation is coming; queued commands will never be flushed
+	r.failAllReconnectQueues(ErrStopped)
 
 	if len(r.conns()) == 0 {
 		r.stopHandlers()

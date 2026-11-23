@@ -284,6 +284,13 @@ func TestConsumerBackoff(t *testing.T) {
 			t.Fatalf("cmd %d bad %s != %s", i, r, expected[i])
 		}
 	}
+
+	q.Stop()
+	select {
+	case <-q.StopChan:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for consumer stop")
+	}
 }
 
 func TestConsumerRequeueNoBackoff(t *testing.T) {
@@ -352,6 +359,13 @@ func TestConsumerRequeueNoBackoff(t *testing.T) {
 		if string(r) != expected[i] {
 			t.Fatalf("cmd %d bad %s != %s", i, r, expected[i])
 		}
+	}
+
+	q.Stop()
+	select {
+	case <-q.StopChan:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for consumer stop")
 	}
 }
 
@@ -467,6 +481,13 @@ func TestConsumerBackoffDisconnect(t *testing.T) {
 			t.Fatalf("cmd %d bad %s != %s", i, r, expected[i])
 		}
 	}
+
+	q.Stop()
+	select {
+	case <-q.StopChan:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for consumer stop")
+	}
 }
 
 func TestConsumerPause(t *testing.T) {
@@ -536,5 +557,12 @@ done:
 		if string(r) != expected[i] {
 			t.Fatalf("cmd %d bad %s != %s", i, r, expected[i])
 		}
+	}
+
+	q.Stop()
+	select {
+	case <-q.StopChan:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for consumer stop")
 	}
 }
