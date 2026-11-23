@@ -90,8 +90,6 @@ type Consumer struct {
 	messagesFinished uint64
 	messagesRequeued uint64
 	totalRdyCount    int64
-	backoffDuration  int64
-	backoffCounter   int32
 	maxInFlight      int32
 
 	mtx sync.RWMutex
@@ -112,12 +110,20 @@ type Consumer struct {
 
 	needRDYRedistributed int32
 
+	// generation is bumped whenever the set of connections is rebuilt
+	// (new connection / reconnect / topology change). Backoff timers capture
+	// the generation they were scheduled under and no-op when it is stale.
+	generation int64
+
 	backoffMtx sync.Mutex
 
 	incomingMessages chan *Message
 
-	rdyRetryMtx    sync.Mutex
-	rdyRetryTimers map[string]*time.Timer
+	// activeMessages tracks messages delivered to a handler but not yet
+	// given a terminal response. It is the local occupancy used to size RDY
+	// and to cancel in-flight work on Stop.
+	activeMessages    map[MessageID]*Message
+	activeMessagesMtx sync.Mutex
 
 	pendingConnections map[string]*Conn
 	connections        map[string]*Conn
@@ -172,7 +178,7 @@ func NewConsumer(topic string, channel string, config *Config) (*Consumer, error
 
 		incomingMessages: make(chan *Message),
 
-		rdyRetryTimers:     make(map[string]*time.Timer),
+		activeMessages:     make(map[MessageID]*Message),
 		pendingConnections: make(map[string]*Conn),
 		connections:        make(map[string]*Conn),
 
@@ -550,7 +556,15 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 
 	atomic.StoreInt32(&r.connectedFlag, 1)
 
-	conn := NewConn(addr, &r.config, &consumerConnDelegate{r})
+	// a new connection incarnation starts a fresh generation: any backoff
+	// timer scheduled under an older generation must not manipulate the
+	// rebuilt RDY state.
+	r.mtx.Lock()
+	r.generation++
+	generation := r.generation
+	r.mtx.Unlock()
+
+	conn := NewConn(addr, &r.config, &consumerConnDelegate{r}, generation)
 	conn.SetLoggerLevel(r.getLogLevel())
 	format := fmt.Sprintf("%3d [%s/%s] (%%s)", r.id, r.topic, r.channel)
 	for index := range r.logger {
@@ -678,27 +692,88 @@ func (r *Consumer) DisconnectFromNSQLookupd(addr string) error {
 
 func (r *Consumer) onConnMessage(c *Conn, msg *Message) {
 	atomic.AddUint64(&r.messagesReceived, 1)
+	r.registerInFlight(c, msg)
+	// while stopping, no new handler should pick this up; the connection's
+	// own drain logic requeues/abandons it rather than blocking the read loop
+	if atomic.LoadInt32(&r.stopFlag) == 1 {
+		return
+	}
 	r.incomingMessages <- msg
+}
+
+// registerInFlight accounts for a delivered message against both the server's
+// RDY credits and the consumer's local handler occupancy.
+func (r *Consumer) registerInFlight(c *Conn, msg *Message) {
+	// delivery consumes one of the server's RDY credits; keep the consumer's
+	// bookkeeping in sync so RDY + local occupancy stays the capacity source
+	// of truth and credits are replenished only as handlers free concurrency
+	if c.RDY() > 0 {
+		atomic.AddInt64(&r.totalRdyCount, -1)
+		c.decrementRDY()
+	}
+	r.activeMessagesMtx.Lock()
+	r.activeMessages[msg.ID] = msg
+	r.activeMessagesMtx.Unlock()
+}
+
+// messageResponded forgets a message once its single terminal response has
+// been queued to the connection. It is the counterpart to the registration
+// done in onConnMessage and frees the local occupancy that sizes RDY.
+func (r *Consumer) messageResponded(msg *Message) {
+	r.activeMessagesMtx.Lock()
+	delete(r.activeMessages, msg.ID)
+	r.activeMessagesMtx.Unlock()
+}
+
+// inFlightCount is the local occupancy: messages delivered to this consumer
+// that have not yet received a terminal response. Unlike the server-side RDY
+// bookkeeping, this counts messages parked inside slow handlers.
+func (r *Consumer) inFlightCount() int64 {
+	r.activeMessagesMtx.Lock()
+	n := int64(len(r.activeMessages))
+	r.activeMessagesMtx.Unlock()
+	return n
+}
+
+// cancelActiveMessages interrupts every still-unresponded message's context
+// so handlers selecting on Message.Context().Done() can unwind during Stop.
+func (r *Consumer) cancelActiveMessages() {
+	r.activeMessagesMtx.Lock()
+	msgs := make([]*Message, 0, len(r.activeMessages))
+	for _, m := range r.activeMessages {
+		msgs = append(msgs, m)
+	}
+	r.activeMessagesMtx.Unlock()
+	for _, m := range msgs {
+		m.cancel()
+	}
+}
+
+// removeConnMessages forgets and cancels in-flight messages that belonged to
+// a closed connection, keeping local occupancy accurate across reconnects.
+func (r *Consumer) removeConnMessages(c *Conn) {
+	r.activeMessagesMtx.Lock()
+	var msgs []*Message
+	for id, m := range r.activeMessages {
+		if m.NSQDAddress == c.String() {
+			delete(r.activeMessages, id)
+			msgs = append(msgs, m)
+		}
+	}
+	r.activeMessagesMtx.Unlock()
+	for _, m := range msgs {
+		m.cancel()
+	}
 }
 
 func (r *Consumer) onConnMessageFinished(c *Conn, msg *Message) {
 	atomic.AddUint64(&r.messagesFinished, 1)
+	r.messageResponded(msg)
 }
 
 func (r *Consumer) onConnMessageRequeued(c *Conn, msg *Message) {
 	atomic.AddUint64(&r.messagesRequeued, 1)
-}
-
-func (r *Consumer) onConnBackoff(c *Conn) {
-	r.startStopContinueBackoff(c, backoffFlag)
-}
-
-func (r *Consumer) onConnContinue(c *Conn) {
-	r.startStopContinueBackoff(c, continueFlag)
-}
-
-func (r *Consumer) onConnResume(c *Conn) {
-	r.startStopContinueBackoff(c, resumeFlag)
+	r.messageResponded(msg)
 }
 
 func (r *Consumer) onConnResponse(c *Conn, data []byte) {
@@ -721,20 +796,18 @@ func (r *Consumer) onConnIOError(c *Conn, err error) {
 }
 
 func (r *Consumer) onConnClose(c *Conn) {
-	var hasRDYRetryTimer bool
+	// a connection going away invalidates its pending backoff timer; make
+	// sure no stale timer callback writes RDY to a dead/replaced connection
+	c.stopBackoffTimer()
 
 	// remove this connections RDY count from the consumer's total
 	rdyCount := c.RDY()
 	atomic.AddInt64(&r.totalRdyCount, -rdyCount)
 
-	r.rdyRetryMtx.Lock()
-	if timer, ok := r.rdyRetryTimers[c.String()]; ok {
-		// stop any pending retry of an old RDY update
-		timer.Stop()
-		delete(r.rdyRetryTimers, c.String())
-		hasRDYRetryTimer = true
-	}
-	r.rdyRetryMtx.Unlock()
+	// any message still registered against this connection can never receive
+	// a terminal response over it; drop the occupancy and interrupt handlers
+	// that are selecting on their message context
+	r.removeConnMessages(c)
 
 	r.mtx.Lock()
 	delete(r.connections, c.String())
@@ -743,8 +816,8 @@ func (r *Consumer) onConnClose(c *Conn) {
 
 	r.log(LogLevelWarning, "there are %d connections left alive", left)
 
-	if (hasRDYRetryTimer || rdyCount > 0) &&
-		(int32(left) == r.getMaxInFlight() || r.inBackoff()) {
+	if rdyCount > 0 &&
+		(int32(left) == r.getMaxInFlight() || c.InBackoff()) {
 		// we're toggling out of (normal) redistribution cases and this conn
 		// had a RDY count...
 		//
@@ -799,123 +872,180 @@ func (r *Consumer) onConnClose(c *Conn) {
 	}
 }
 
+func (r *Consumer) onConnBackoff(c *Conn) {
+	r.startStopContinueBackoff(c, backoffFlag)
+}
+
+func (r *Consumer) onConnContinue(c *Conn) {
+	r.startStopContinueBackoff(c, continueFlag)
+}
+
+func (r *Consumer) onConnResume(c *Conn) {
+	r.startStopContinueBackoff(c, resumeFlag)
+}
+
+// startStopContinueBackoff drives the per-connection backoff machine.
+//
+// Backoff is scoped to the connection that produced the failed message:
+// RDY on every other connection keeps flowing. Signals arriving while the
+// backoff timer is ticking are coalesced (the timer's own resume re-reads the
+// counter), preventing a burst of failures from instantly saturating the
+// bounded backoff duration.
 func (r *Consumer) startStopContinueBackoff(conn *Conn, signal backoffSignal) {
-	// prevent many async failures/successes from immediately resulting in
-	// max backoff/normal rate (by ensuring that we dont continually incr/decr
-	// the counter during a backoff period)
+	// serialize backoff transitions across connections, and protect the
+	// per-connection timer bookkeeping
 	r.backoffMtx.Lock()
 	defer r.backoffMtx.Unlock()
-	if r.inBackoffTimeout() {
+
+	if conn.InBackoffTimeout() {
+		// a backoff wait is already in flight; the resume callback will
+		// observe the updated counter, so drop this coalesced signal
 		return
 	}
 
-	// update backoff state
-	backoffUpdated := false
-	backoffCounter := atomic.LoadInt32(&r.backoffCounter)
+	counter := atomic.LoadInt32(&conn.backoff.counter)
+	wasInBackoff := counter > 0
 	switch signal {
 	case resumeFlag:
-		if backoffCounter > 0 {
-			backoffCounter--
-			backoffUpdated = true
+		if counter > 0 {
+			counter--
+			atomic.StoreInt32(&conn.backoff.counter, counter)
 		}
 	case backoffFlag:
-		nextBackoff := r.config.BackoffStrategy.Calculate(int(backoffCounter) + 1)
+		nextBackoff := r.config.BackoffStrategy.Calculate(int(counter) + 1)
 		if nextBackoff <= r.config.MaxBackoffDuration {
-			backoffCounter++
-			backoffUpdated = true
+			counter++
+			atomic.StoreInt32(&conn.backoff.counter, counter)
 		}
+	case continueFlag:
+		// RequeueWithoutBackoff: neither escalate nor de-escalate the
+		// counter/timer. The consumed RDY credit still has to be replenished
+		// (one-at-a-time while in backoff) so the probe flow is not parked
+		// waiting on a backoff timer that did not restart.
+		if wasInBackoff {
+			r.log(LogLevelDebug,
+				"(%s) backoff unaffected by requeue-without-backoff, replenishing RDY 1",
+				conn.String())
+			r.updateRDY(conn, 1)
+		}
+		return
 	}
-	atomic.StoreInt32(&r.backoffCounter, backoffCounter)
 
-	if r.backoffCounter == 0 && backoffUpdated {
-		// exit backoff
-		count := r.perConnMaxInFlight()
-		r.log(LogLevelWarning, "exiting backoff, returning all to RDY %d", count)
-		for _, c := range r.conns() {
-			r.updateRDY(c, count)
-		}
-	} else if r.backoffCounter > 0 {
-		// start or continue backoff
-		backoffDuration := r.config.BackoffStrategy.Calculate(int(backoffCounter))
-
+	switch {
+	case wasInBackoff && counter == 0:
+		// exit backoff and restore the RDY this connection can actually use
+		count := r.targetRDY(conn)
+		r.log(LogLevelWarning,
+			"(%s) exiting backoff, returning to RDY %d", conn.String(), count)
+		r.updateRDY(conn, count)
+	case counter > 0 && signal != resumeFlag:
+		// a new failure starts or deepens backoff on this connection only
+		backoffDuration := r.config.BackoffStrategy.Calculate(int(counter))
 		if backoffDuration > r.config.MaxBackoffDuration {
 			backoffDuration = r.config.MaxBackoffDuration
 		}
 
-		r.log(LogLevelWarning, "backing off for %s (backoff level %d), setting all to RDY 0",
-			backoffDuration, backoffCounter)
+		r.log(LogLevelWarning,
+			"(%s) backing off for %s (backoff level %d), setting RDY 0",
+			conn.String(), backoffDuration, counter)
 
-		// send RDY 0 immediately (to *all* connections)
-		for _, c := range r.conns() {
-			r.updateRDY(c, 0)
+		// stop delivery on this connection only; other ready connections
+		// (and idle local handlers) keep processing messages
+		r.updateRDY(conn, 0)
+		r.scheduleBackoff(conn, backoffDuration)
+	case counter > 0:
+		// a successful probe during backoff (resumeFlag): hold the reduced
+		// level and re-arm the bounded wait before probing again
+		backoffDuration := r.config.BackoffStrategy.Calculate(int(counter))
+		if backoffDuration > r.config.MaxBackoffDuration {
+			backoffDuration = r.config.MaxBackoffDuration
 		}
-
-		r.backoff(backoffDuration)
+		r.scheduleBackoff(conn, backoffDuration)
 	}
 }
 
-func (r *Consumer) backoff(d time.Duration) {
-	atomic.StoreInt64(&r.backoffDuration, d.Nanoseconds())
-	time.AfterFunc(d, r.resume)
+// scheduleBackoff arms the bounded, generation-aware backoff timer for a
+// connection. Any previously pending timer is replaced.
+func (r *Consumer) scheduleBackoff(conn *Conn, d time.Duration) {
+	conn.backoff.timerMtx.Lock()
+	defer conn.backoff.timerMtx.Unlock()
+	if conn.backoff.timer != nil {
+		conn.backoff.timer.Stop()
+	}
+	generation := conn.Generation()
+	atomic.StoreInt64(&conn.backoff.duration, d.Nanoseconds())
+	conn.backoff.timer = time.AfterFunc(d, func() {
+		r.resumeConn(conn, generation)
+	})
 }
 
-func (r *Consumer) resume() {
+// resumeConn is the backoff timer callback. It no-ops when the connection
+// incarnation it belongs to has been superseded or closed.
+func (r *Consumer) resumeConn(conn *Conn, generation int64) {
 	if atomic.LoadInt32(&r.stopFlag) == 1 {
-		atomic.StoreInt64(&r.backoffDuration, 0)
+		atomic.StoreInt64(&conn.backoff.duration, 0)
+		return
+	}
+	if conn.IsClosing() || conn.Generation() != generation {
+		// topology/reconnect generation change: this timer is stale
+		atomic.StoreInt64(&conn.backoff.duration, 0)
 		return
 	}
 
-	// pick a random connection to test the waters
-	conns := r.conns()
-	if len(conns) == 0 {
-		r.log(LogLevelWarning, "no connection available to resume")
-		r.log(LogLevelWarning, "backing off for %s", time.Second)
-		r.backoff(time.Second)
+	r.backoffMtx.Lock()
+	defer r.backoffMtx.Unlock()
+
+	atomic.StoreInt64(&conn.backoff.duration, 0)
+
+	if !conn.InBackoff() {
+		// counter was drained by successful messages while the timer raced;
+		// just restore normal RDY
+		r.updateRDY(conn, r.targetRDY(conn))
 		return
 	}
-	r.rngMtx.Lock()
-	idx := r.rng.Intn(len(conns))
-	r.rngMtx.Unlock()
-	choice := conns[idx]
 
 	r.log(LogLevelWarning,
-		"(%s) backoff timeout expired, sending RDY 1",
-		choice.String())
+		"(%s) backoff timeout expired, sending RDY 1", conn.String())
 
 	// while in backoff only ever let 1 message at a time through
-	err := r.updateRDY(choice, 1)
-	if err != nil {
-		r.log(LogLevelWarning, "(%s) error resuming RDY 1 - %s", choice.String(), err)
-		r.log(LogLevelWarning, "backing off for %s", time.Second)
-		r.backoff(time.Second)
-		return
+	if err := r.updateRDY(conn, 1); err != nil {
+		r.log(LogLevelWarning, "(%s) error resuming RDY 1 - %s", conn.String(), err)
+		r.scheduleBackoff(conn, time.Second)
 	}
-
-	atomic.StoreInt64(&r.backoffDuration, 0)
-}
-
-func (r *Consumer) inBackoff() bool {
-	return atomic.LoadInt32(&r.backoffCounter) > 0
-}
-
-func (r *Consumer) inBackoffTimeout() bool {
-	return atomic.LoadInt64(&r.backoffDuration) > 0
 }
 
 func (r *Consumer) maybeUpdateRDY(conn *Conn) {
-	inBackoff := r.inBackoff()
-	inBackoffTimeout := r.inBackoffTimeout()
-	if inBackoff || inBackoffTimeout {
+	if conn.InBackoff() || conn.InBackoffTimeout() {
 		r.log(LogLevelDebug, "(%s) skip sending RDY inBackoff:%v || inBackoffTimeout:%v",
-			conn, inBackoff, inBackoffTimeout)
+			conn, conn.InBackoff(), conn.InBackoffTimeout())
 		return
 	}
 
-	count := r.perConnMaxInFlight()
+	count := r.targetRDY(conn)
 	r.log(LogLevelDebug, "(%s) sending RDY %d", conn, count)
 	if err := r.updateRDY(conn, count); err != nil {
 		r.log(LogLevelWarning, "(%s) error sending RDY %d: %v", conn, count, err)
 	}
+}
+
+// targetRDY computes the RDY level a connection may hold given the actual
+// local occupancy. In-flight, un-finished handlers consume capacity just
+// like outstanding RDY credits, so RDY only ever replenishes genuinely idle
+// concurrency and a slow handler cannot cause the server to over-deliver.
+func (r *Consumer) targetRDY(c *Conn) int64 {
+	maxInFlight := int64(r.getMaxInFlight())
+	// never request more than this connection's fair share, and never more
+	// than the idle concurrency the whole consumer currently has
+	perConn := r.perConnMaxInFlight()
+	idle := maxInFlight - r.inFlightCount()
+	if idle < 0 {
+		idle = 0
+	}
+	count := perConn
+	if idle < count {
+		count = idle
+	}
+	return count
 }
 
 func (r *Consumer) rdyLoop() {
@@ -946,33 +1076,18 @@ func (r *Consumer) updateRDY(c *Conn, count int64) error {
 		count = c.MaxRDY()
 	}
 
-	// stop any pending retry of an old RDY update
-	r.rdyRetryMtx.Lock()
-	if timer, ok := r.rdyRetryTimers[c.String()]; ok {
-		timer.Stop()
-		delete(r.rdyRetryTimers, c.String())
-	}
-	r.rdyRetryMtx.Unlock()
-
-	// never exceed our global max in flight. truncate if possible.
-	// this could help a new connection get partial max-in-flight
+	// capacity is shared by outstanding RDY credits and messages already
+	// being processed locally; count the local occupancy so replenishing a
+	// credit consumed by an in-flight (not yet responded) message is allowed
 	rdyCount := c.RDY()
-	maxPossibleRdy := int64(r.getMaxInFlight()) - atomic.LoadInt64(&r.totalRdyCount) + rdyCount
+	maxPossibleRdy := int64(r.getMaxInFlight()) -
+		atomic.LoadInt64(&r.totalRdyCount) - r.inFlightCount() + rdyCount
 	if maxPossibleRdy > 0 && maxPossibleRdy < count {
 		count = maxPossibleRdy
 	}
-	if maxPossibleRdy <= 0 && count > 0 {
-		if rdyCount == 0 {
-			// we wanted to exit a zero RDY count but we couldn't send it...
-			// in order to prevent eternal starvation we reschedule this attempt
-			// (if any other RDY update succeeds this timer will be stopped)
-			r.rdyRetryMtx.Lock()
-			r.rdyRetryTimers[c.String()] = time.AfterFunc(5*time.Second,
-				func() {
-					r.updateRDY(c, count)
-				})
-			r.rdyRetryMtx.Unlock()
-		}
+	if maxPossibleRdy <= 0 && count > rdyCount {
+		// no global headroom remains; the next terminal response (which frees
+		// local occupancy) re-arms RDY, so there is nothing to retry here
 		return ErrOverMaxInFlight
 	}
 
@@ -1001,13 +1116,11 @@ func (r *Consumer) sendRDY(c *Conn, count int64) error {
 	return nil
 }
 
+// redistributeRDY periodically rebalances RDY across connections while
+// respecting both the global MaxInFlight budget and each connection's
+// backoff state. Connections parked in backoff never receive redistributed
+// credits, so a failing connection cannot starve the healthy ones.
 func (r *Consumer) redistributeRDY() {
-	if r.inBackoffTimeout() {
-		return
-	}
-
-	// if an external heuristic set needRDYRedistributed we want to wait
-	// until we can actually redistribute to proceed
 	conns := r.conns()
 	if len(conns) == 0 {
 		return
@@ -1020,9 +1133,12 @@ func (r *Consumer) redistributeRDY() {
 		atomic.StoreInt32(&r.needRDYRedistributed, 1)
 	}
 
-	if r.inBackoff() && len(conns) > 1 {
-		r.log(LogLevelDebug, "redistributing RDY state (in backoff and %d conns > 1)", len(conns))
-		atomic.StoreInt32(&r.needRDYRedistributed, 1)
+	for _, c := range conns {
+		if c.InBackoff() && len(conns) > 1 {
+			r.log(LogLevelDebug, "redistributing RDY state (%s in backoff)", c.String())
+			atomic.StoreInt32(&r.needRDYRedistributed, 1)
+			break
+		}
 	}
 
 	if !atomic.CompareAndSwapInt32(&r.needRDYRedistributed, 1, 0) {
@@ -1045,13 +1161,15 @@ func (r *Consumer) redistributeRDY() {
 				r.updateRDY(c, 0)
 			}
 		}
-		possibleConns = append(possibleConns, c)
+		// backoff connections are not candidates for donated credits
+		if !c.InBackoff() && !c.InBackoffTimeout() {
+			possibleConns = append(possibleConns, c)
+		}
 	}
 
-	availableMaxInFlight := int64(maxInFlight) - atomic.LoadInt64(&r.totalRdyCount)
-	if r.inBackoff() {
-		availableMaxInFlight = 1 - atomic.LoadInt64(&r.totalRdyCount)
-	}
+	// headroom is measured against local occupancy plus outstanding RDY,
+	// so redistribution can never promise more than the idle concurrency
+	availableMaxInFlight := int64(maxInFlight) - r.inFlightCount() - atomic.LoadInt64(&r.totalRdyCount)
 
 	for len(possibleConns) > 0 && availableMaxInFlight > 0 {
 		availableMaxInFlight--
@@ -1062,7 +1180,7 @@ func (r *Consumer) redistributeRDY() {
 		// delete
 		possibleConns = append(possibleConns[:i], possibleConns[i+1:]...)
 		r.log(LogLevelDebug, "(%s) redistributing RDY", c.String())
-		r.updateRDY(c, 1)
+		r.updateRDY(c, c.RDY()+1)
 	}
 }
 
@@ -1076,10 +1194,25 @@ func (r *Consumer) Stop() {
 
 	r.log(LogLevelInfo, "stopping...")
 
-	if len(r.conns()) == 0 {
+	conns := r.conns()
+
+	// revoke every unused RDY credit and silence backoff timers so no new
+	// message can be delivered or re-armed while in-flight work drains
+	for _, c := range conns {
+		c.stopBackoffTimer()
+		if err := r.updateRDY(c, 0); err != nil {
+			r.log(LogLevelWarning, "(%s) error revoking RDY - %s", c.String(), err)
+		}
+	}
+
+	// interrupt handlers parked on long-running work; handlers that ignore
+	// the context are still bounded by the forced-exit timer below
+	r.cancelActiveMessages()
+
+	if len(conns) == 0 {
 		r.stopHandlers()
 	} else {
-		for _, c := range r.conns() {
+		for _, c := range conns {
 			err := c.WriteCommand(StartClose())
 			if err != nil {
 				r.log(LogLevelError, "(%s) error sending CLS - %s", c.String(), err)

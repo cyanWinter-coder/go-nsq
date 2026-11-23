@@ -43,6 +43,18 @@ type msgResponse struct {
 	backoff bool
 }
 
+// backoffState tracks the per-connection backoff machine.
+//
+// Backoff is scoped to a single connection so that a failing nsqd can no
+// longer stall message delivery on the consumer's other connections.
+type backoffState struct {
+	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
+	counter  int32
+	duration int64
+	timer    *time.Timer
+	timerMtx sync.Mutex
+}
+
 // Conn represents a connection to nsqd
 //
 // Conn exposes a set of callbacks for the
@@ -63,7 +75,14 @@ type Conn struct {
 	tlsConn *tls.Conn
 	addr    string
 
+	// generation identifies the connection incarnation the consumer
+	// created this Conn for; timers use it to ignore stale callbacks
+	// after a reconnect/topology change.
+	generation int64
+
 	delegate ConnDelegate
+
+	backoff backoffState
 
 	logger   []logger
 	logLvl   LogLevel
@@ -86,15 +105,16 @@ type Conn struct {
 }
 
 // NewConn returns a new Conn instance
-func NewConn(addr string, config *Config, delegate ConnDelegate) *Conn {
+func NewConn(addr string, config *Config, delegate ConnDelegate, generation int64) *Conn {
 	if !config.initialized {
 		panic("Config must be created with NewConfig()")
 	}
 	return &Conn{
 		addr: addr,
 
-		config:   config,
-		delegate: delegate,
+		config:     config,
+		delegate:   delegate,
+		generation: generation,
 
 		maxRdyCount:      2500,
 		lastMsgTimestamp: time.Now().UnixNano(),
@@ -107,6 +127,42 @@ func NewConn(addr string, config *Config, delegate ConnDelegate) *Conn {
 		logger: make([]logger, LogLevelMax+1),
 		logFmt: make([]string, LogLevelMax+1),
 	}
+}
+
+// Generation returns the consumer-level generation id assigned when this
+// connection incarnation was created.
+func (c *Conn) Generation() int64 {
+	return atomic.LoadInt64(&c.generation)
+}
+
+// setGeneration supersedes a connection's generation (used to invalidate
+// in-flight timers after a reconnect/topology change).
+func (c *Conn) setGeneration(generation int64) {
+	atomic.StoreInt64(&c.generation, generation)
+}
+
+// InBackoff reports whether this connection is in a backoff state
+// (counter raised, regardless of whether the wait timer is currently ticking).
+func (c *Conn) InBackoff() bool {
+	return atomic.LoadInt32(&c.backoff.counter) > 0
+}
+
+// InBackoffTimeout reports whether this connection is currently waiting
+// out a backoff interval.
+func (c *Conn) InBackoffTimeout() bool {
+	return atomic.LoadInt64(&c.backoff.duration) > 0
+}
+
+// stopBackoffTimer cancels any pending backoff timer. It is used when the
+// connection goes away or its generation is invalidated so a stale timer
+// can never touch a new connection's RDY state.
+func (c *Conn) stopBackoffTimer() {
+	c.backoff.timerMtx.Lock()
+	if c.backoff.timer != nil {
+		c.backoff.timer.Stop()
+		c.backoff.timer = nil
+	}
+	c.backoff.timerMtx.Unlock()
 }
 
 // SetLogger assigns the logger to use as well as a level.
@@ -244,6 +300,20 @@ func (c *Conn) SetRDY(rdy int64) {
 	atomic.StoreInt64(&c.rdyCount, rdy)
 	if rdy > 0 {
 		atomic.StoreInt64(&c.lastRdyTimestamp, time.Now().UnixNano())
+	}
+}
+
+// decrementRDY accounts for one delivered message consuming an RDY credit.
+// It never drives the count below zero.
+func (c *Conn) decrementRDY() {
+	for {
+		rdy := atomic.LoadInt64(&c.rdyCount)
+		if rdy <= 0 {
+			return
+		}
+		if atomic.CompareAndSwapInt64(&c.rdyCount, rdy, rdy-1) {
+			return
+		}
 	}
 }
 
@@ -738,6 +808,11 @@ func (c *Conn) onMessageRequeue(m *Message, delay time.Duration, backoff bool) {
 		if delay > c.config.MaxRequeueDelay {
 			delay = c.config.MaxRequeueDelay
 		}
+	}
+	// hard-cap every requeue delay, including caller-supplied values,
+	// so a transient failure can never park a message indefinitely
+	if c.config.MaxRequeueDelay > 0 && delay > c.config.MaxRequeueDelay {
+		delay = c.config.MaxRequeueDelay
 	}
 	c.msgResponseChan <- &msgResponse{msg: m, cmd: Requeue(m.ID, delay), success: false, backoff: backoff}
 }

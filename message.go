@@ -1,9 +1,11 @@
 package nsq
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -28,20 +30,61 @@ type Message struct {
 
 	autoResponseDisabled int32
 	responded            int32
+
+	// responseMtx serializes the decision logic of Finish/Requeue/Touch so
+	// that a Touch racing with a terminal response can never observe a
+	// stale state (the old HasResponded() check was a TOCTOU window).
+	responseMtx sync.Mutex
+
+	// ctx is canceled when the Consumer is stopping; handlers that select on
+	// it can abandon in-flight work instead of blocking shutdown.
+	ctx      context.Context
+	cancelFn context.CancelFunc
 }
 
 // NewMessage creates a Message, initializes some metadata,
 // and returns a pointer
 func NewMessage(id MessageID, body []byte) *Message {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Message{
 		ID:        id,
 		Body:      body,
 		Timestamp: time.Now().UnixNano(),
+		ctx:       ctx,
+		cancelFn:  cancel,
+	}
+}
+
+// Context returns a context that is canceled when the Consumer shuts down
+// while this message is still in flight. Handlers may select on
+// Context().Done() to make long-running processing interruptible.
+func (m *Message) Context() context.Context {
+	return m.ctx
+}
+
+// Canceled is a non-blocking check for whether the Consumer has given up
+// waiting for this message's handler to complete.
+func (m *Message) Canceled() bool {
+	select {
+	case <-m.ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// cancel interrupts a handler blocked on Context().Done(). It is a no-op once
+// a terminal response (FIN/REQ) has been sent, because a responded message is
+// no longer considered in flight by the Consumer.
+func (m *Message) cancel() {
+	m.responseMtx.Lock()
+	defer m.responseMtx.Unlock()
+	if atomic.LoadInt32(&m.responded) == 0 {
+		m.cancelFn()
 	}
 }
 
 // DisableAutoResponse disables the automatic response that
-// would normally be sent when a handler.HandleMessage
 // returns (FIN/REQ based on the error value returned).
 //
 // This is useful if you want to batch, buffer, or asynchronously
@@ -64,7 +107,7 @@ func (m *Message) HasResponded() bool {
 // Finish sends a FIN command to the nsqd which
 // sent this message
 func (m *Message) Finish() {
-	if !atomic.CompareAndSwapInt32(&m.responded, 0, 1) {
+	if !m.beginTerminalResponse() {
 		return
 	}
 	m.Delegate.OnFinish(m)
@@ -73,7 +116,11 @@ func (m *Message) Finish() {
 // Touch sends a TOUCH command to the nsqd which
 // sent this message
 func (m *Message) Touch() {
-	if m.HasResponded() {
+	m.responseMtx.Lock()
+	defer m.responseMtx.Unlock()
+	// holding responseMtx guarantees a Finish/Requeue cannot win the
+	// terminal-state CAS between this check and the delegate call
+	if atomic.LoadInt32(&m.responded) == 1 {
 		return
 	}
 	m.Delegate.OnTouch(m)
@@ -99,10 +146,20 @@ func (m *Message) RequeueWithoutBackoff(delay time.Duration) {
 }
 
 func (m *Message) doRequeue(delay time.Duration, backoff bool) {
-	if !atomic.CompareAndSwapInt32(&m.responded, 0, 1) {
+	if !m.beginTerminalResponse() {
 		return
 	}
 	m.Delegate.OnRequeue(m, delay, backoff)
+}
+
+// beginTerminalResponse claims the single terminal-response slot.
+// Only the first Finish/Requeue wins; every later terminal call, and any
+// Touch after it, is suppressed. The mutex makes the claim mutually
+// exclusive with Touch's state check.
+func (m *Message) beginTerminalResponse() bool {
+	m.responseMtx.Lock()
+	defer m.responseMtx.Unlock()
+	return atomic.CompareAndSwapInt32(&m.responded, 0, 1)
 }
 
 // WriteTo implements the WriterTo interface and serializes
@@ -140,14 +197,15 @@ func (m *Message) WriteTo(w io.Writer) (int64, error) {
 
 // DecodeMessage deserializes data (as []byte) and creates a new Message
 // message format:
-//  [x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x]...
-//  |       (int64)        ||    ||      (hex string encoded in ASCII)           || (binary)
-//  |       8-byte         ||    ||                 16-byte                      || N-byte
-//  ------------------------------------------------------------------------------------------...
-//    nanosecond timestamp    ^^                   message ID                       message body
-//                         (uint16)
-//                          2-byte
-//                         attempts
+//
+//	[x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x]...
+//	|       (int64)        ||    ||      (hex string encoded in ASCII)           || (binary)
+//	|       8-byte         ||    ||                 16-byte                      || N-byte
+//	------------------------------------------------------------------------------------------...
+//	  nanosecond timestamp    ^^                   message ID                       message body
+//	                       (uint16)
+//	                        2-byte
+//	                       attempts
 func DecodeMessage(b []byte) (*Message, error) {
 	var msg Message
 

@@ -213,6 +213,18 @@ func frameMessage(m *Message) []byte {
 	return b.Bytes()
 }
 
+// stopConsumer cleanly stops a test consumer so its reconnect/backoff
+// goroutines cannot outlive the test (which would race with t logging).
+func stopConsumer(t *testing.T, q *Consumer) {
+	t.Helper()
+	q.Stop()
+	select {
+	case <-q.StopChan:
+	case <-time.After(2 * time.Second):
+		t.Fatal("consumer did not stop in time")
+	}
+}
+
 func TestConsumerBackoff(t *testing.T) {
 	msgIDGood := MessageID{'1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 'a', 's', 'd', 'f', 'g', 'h'}
 	msgGood := NewMessage(msgIDGood, []byte("good"))
@@ -267,10 +279,8 @@ func TestConsumerBackoff(t *testing.T) {
 		"RDY 0",
 		fmt.Sprintf("REQ %s 0", msgIDBad),
 		"RDY 1",
-		"RDY 0",
 		fmt.Sprintf("REQ %s 0", msgIDBad),
 		"RDY 1",
-		"RDY 0",
 		fmt.Sprintf("FIN %s", msgIDGood),
 		"RDY 1",
 		"RDY 5",
@@ -284,6 +294,7 @@ func TestConsumerBackoff(t *testing.T) {
 			t.Fatalf("cmd %d bad %s != %s", i, r, expected[i])
 		}
 	}
+	stopConsumer(t, q)
 }
 
 func TestConsumerRequeueNoBackoff(t *testing.T) {
@@ -337,10 +348,9 @@ func TestConsumerRequeueNoBackoff(t *testing.T) {
 		"IDENTIFY",
 		"SUB " + topicName + " ch",
 		"RDY 1",
-		"RDY 0",
 		fmt.Sprintf("REQ %s 0", msgIDRequeue),
 		"RDY 1",
-		"RDY 0",
+		"RDY 1",
 		fmt.Sprintf("REQ %s 0", msgIDRequeueNoBackoff),
 		"RDY 1",
 		fmt.Sprintf("FIN %s", msgIDGood),
@@ -353,6 +363,7 @@ func TestConsumerRequeueNoBackoff(t *testing.T) {
 			t.Fatalf("cmd %d bad %s != %s", i, r, expected[i])
 		}
 	}
+	stopConsumer(t, q)
 }
 
 func TestConsumerBackoffDisconnect(t *testing.T) {
@@ -411,10 +422,8 @@ func TestConsumerBackoffDisconnect(t *testing.T) {
 		"RDY 0",
 		fmt.Sprintf("REQ %s 0", msgIDRequeue),
 		"RDY 1",
-		"RDY 0",
 		fmt.Sprintf("REQ %s 0", msgIDRequeue),
 		"RDY 1",
-		"RDY 0",
 		fmt.Sprintf("FIN %s", msgIDGood),
 		"RDY 1",
 	}
@@ -454,7 +463,6 @@ func TestConsumerBackoffDisconnect(t *testing.T) {
 	expected = []string{
 		"IDENTIFY",
 		"SUB " + topicName + " ch",
-		"RDY 1",
 		"RDY 5",
 		fmt.Sprintf("FIN %s", msgIDGood),
 		fmt.Sprintf("FIN %s", msgIDGood),
@@ -467,6 +475,7 @@ func TestConsumerBackoffDisconnect(t *testing.T) {
 			t.Fatalf("cmd %d bad %s != %s", i, r, expected[i])
 		}
 	}
+	stopConsumer(t, q)
 }
 
 func TestConsumerPause(t *testing.T) {
@@ -537,4 +546,5 @@ done:
 			t.Fatalf("cmd %d bad %s != %s", i, r, expected[i])
 		}
 	}
+	stopConsumer(t, q)
 }

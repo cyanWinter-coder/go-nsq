@@ -304,7 +304,7 @@ func (w *Producer) connect() error {
 
 	w.log(LogLevelInfo, "(%s) connecting to nsqd", w.addr)
 
-	w.conn = NewConn(w.addr, &w.config, &producerConnDelegate{w})
+	w.conn = NewConn(w.addr, &w.config, &producerConnDelegate{w}, 0)
 	w.conn.SetLoggerLevel(w.getLogLevel())
 	format := fmt.Sprintf("%3d (%%s)", w.id)
 	for index := range w.logger {
