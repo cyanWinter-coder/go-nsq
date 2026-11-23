@@ -1,6 +1,7 @@
 package nsq
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -41,6 +42,7 @@ type Producer struct {
 	transactionChan chan *ProducerTransaction
 	transactions    []*ProducerTransaction
 	state           int32
+	batchSeq        int64
 
 	concurrentProducers int32
 	stopFlag            int32
@@ -55,6 +57,7 @@ type Producer struct {
 type ProducerTransaction struct {
 	cmd      *Command
 	doneChan chan *ProducerTransaction
+	batch    *PublishBatch // set when the transaction carries a reconcilable batch
 	Error    error         // the error (or nil) of the publish command
 	Args     []interface{} // the slice of variadic arguments passed to PublishAsync or MultiPublishAsync
 }
@@ -210,6 +213,81 @@ func (w *Producer) MultiPublishAsync(topic string, body [][]byte, doneChan chan 
 	return w.sendCommandAsync(cmd, doneChan, args)
 }
 
+// NewBatch creates a reconcilable PublishBatch for the given messages.
+//
+// The batch is assigned a stable correlation ID and one result slot per
+// message; submit it with PublishBatchAsync. The supplied bodies must not
+// be mutated until the batch reaches a terminal state.
+func (w *Producer) NewBatch(topic string, bodies [][]byte) (*PublishBatch, error) {
+	if len(bodies) == 0 {
+		return nil, errors.New("nsq: batch must contain at least one message")
+	}
+	if !IsValidTopicName(topic) {
+		return nil, fmt.Errorf("nsq: invalid topic name %q", topic)
+	}
+	id := fmt.Sprintf("%d-%d", w.id, atomic.AddInt64(&w.batchSeq, 1))
+	return newBatch(topic, bodies, id), nil
+}
+
+// PublishBatchAsync submits a batch created by NewBatch (or derived via
+// PublishBatch.RetryBatch) without waiting for the response from `nsqd`.
+//
+// The batch is written to at most one connection, exactly once. When every
+// message in the batch has resolved — per-message response, connection
+// loss, or cancellation — the batch reaches a terminal state: its Done
+// channel is closed, Wait unblocks, and the supplied doneChan (if
+// specified) receives the batch. doneChan should be buffered or actively
+// drained.
+//
+// A batch instance can be submitted only once; retrying failures requires
+// deriving a new batch via RetryBatch.
+func (w *Producer) PublishBatchAsync(b *PublishBatch, doneChan chan *PublishBatch) error {
+	if b == nil {
+		return errors.New("nsq: cannot publish a nil batch")
+	}
+	cmd, err := b.command()
+	if err != nil {
+		return err
+	}
+	if !b.queue(doneChan) {
+		return fmt.Errorf("nsq: batch %s was already submitted", b.ID)
+	}
+	err = w.sendTransactionAsync(&ProducerTransaction{cmd: cmd, batch: b})
+	if err != nil {
+		b.applyConnError(err)
+		return err
+	}
+	return nil
+}
+
+// MultiPublishBatchAsync creates and submits a PublishBatch for the given
+// messages, returning the batch so its per-message results can be
+// reconciled once it completes. See PublishBatchAsync for the completion
+// semantics of doneChan.
+func (w *Producer) MultiPublishBatchAsync(topic string, bodies [][]byte,
+	doneChan chan *PublishBatch) (*PublishBatch, error) {
+	b, err := w.NewBatch(topic, bodies)
+	if err != nil {
+		return nil, err
+	}
+	if err := w.PublishBatchAsync(b, doneChan); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// MultiPublishBatch synchronously publishes a batch of messages, returning
+// the completed batch and its aggregate outcome: nil if every message was
+// accepted, or a *BatchError identifying the individual failures (only
+// those messages should be retried, e.g. via PublishBatch.RetryBatch).
+func (w *Producer) MultiPublishBatch(topic string, bodies [][]byte) (*PublishBatch, error) {
+	b, err := w.MultiPublishBatchAsync(topic, bodies, nil)
+	if err != nil {
+		return nil, err
+	}
+	return b, b.Wait()
+}
+
 // Publish synchronously publishes a message body to the specified topic, returning
 // an error if publish failed
 func (w *Producer) Publish(topic string, body []byte) error {
@@ -259,6 +337,14 @@ func (w *Producer) sendCommand(cmd *Command) error {
 
 func (w *Producer) sendCommandAsync(cmd *Command, doneChan chan *ProducerTransaction,
 	args []interface{}) error {
+	return w.sendTransactionAsync(&ProducerTransaction{
+		cmd:      cmd,
+		doneChan: doneChan,
+		Args:     args,
+	})
+}
+
+func (w *Producer) sendTransactionAsync(t *ProducerTransaction) error {
 	// keep track of how many outstanding producers we're dealing with
 	// in order to later ensure that we clean them all up...
 	atomic.AddInt32(&w.concurrentProducers, 1)
@@ -269,12 +355,6 @@ func (w *Producer) sendCommandAsync(cmd *Command, doneChan chan *ProducerTransac
 		if err != nil {
 			return err
 		}
-	}
-
-	t := &ProducerTransaction{
-		cmd:      cmd,
-		doneChan: doneChan,
-		Args:     args,
 	}
 
 	select {
@@ -342,6 +422,11 @@ func (w *Producer) router() {
 	for {
 		select {
 		case t := <-w.transactionChan:
+			if t.batch != nil && !t.batch.markSent(w.conn) {
+				// the batch was canceled while queued; it must not
+				// be written to the connection
+				continue
+			}
 			w.transactions = append(w.transactions, t)
 			err := w.conn.WriteCommand(t.cmd)
 			if err != nil {
@@ -379,6 +464,10 @@ func (w *Producer) popTransaction(frameType int32, data []byte) {
 	}
 	t := w.transactions[0]
 	w.transactions = w.transactions[1:]
+	if t.batch != nil {
+		t.batch.applyResponse(frameType, data)
+		return
+	}
 	if frameType == FrameTypeError {
 		t.Error = ErrProtocol{string(data)}
 	}
@@ -388,6 +477,10 @@ func (w *Producer) popTransaction(frameType int32, data []byte) {
 func (w *Producer) transactionCleanup() {
 	// clean up transactions we can easily account for
 	for _, t := range w.transactions {
+		if t.batch != nil {
+			t.batch.applyConnError(ErrNotConnected)
+			continue
+		}
 		t.Error = ErrNotConnected
 		t.finish()
 	}
@@ -399,6 +492,10 @@ func (w *Producer) transactionCleanup() {
 	for {
 		select {
 		case t := <-w.transactionChan:
+			if t.batch != nil {
+				t.batch.applyConnError(ErrNotConnected)
+				continue
+			}
 			t.Error = ErrNotConnected
 			t.finish()
 		default:
