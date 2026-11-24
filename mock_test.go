@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -37,19 +38,31 @@ type instruction struct {
 }
 
 type mockNSQD struct {
-	t           *testing.T
-	script      []instruction
-	got         [][]byte
-	tcpAddr     *net.TCPAddr
-	tcpListener net.Listener
-	exitChan    chan int
+	t                 *testing.T
+	script            []instruction
+	got               [][]byte
+	gotMtx            sync.Mutex
+	tcpAddr           *net.TCPAddr
+	tcpListener       net.Listener
+	exitChan          chan int
+	wg                sync.WaitGroup
+	listenerCloseOnce sync.Once
+	// when true, CLOSE_WAIT is acknowledged but the server side of the
+	// connection stays open until the mock shuts down (mirrors nsqd waiting
+	// for in-flight handlers to drain)
+	holdAfterCloseWait bool
 }
 
 func newMockNSQD(t *testing.T, script []instruction, addr string) *mockNSQD {
+	return newMockNSQDOpts(t, script, addr, false)
+}
+
+func newMockNSQDOpts(t *testing.T, script []instruction, addr string, holdAfterCloseWait bool) *mockNSQD {
 	n := &mockNSQD{
-		t:        t,
-		script:   script,
-		exitChan: make(chan int),
+		t:                  t,
+		script:             script,
+		exitChan:           make(chan int),
+		holdAfterCloseWait: holdAfterCloseWait,
 	}
 
 	tcpListener, err := net.Listen("tcp", addr)
@@ -59,12 +72,28 @@ func newMockNSQD(t *testing.T, script []instruction, addr string) *mockNSQD {
 	n.tcpListener = tcpListener
 	n.tcpAddr = tcpListener.Addr().(*net.TCPAddr)
 
+	n.wg.Add(1)
 	go n.listen()
+
+	// ensure the listener is shut and every mock goroutine has exited before
+	// the test completes, so detached goroutines can not log past teardown
+	t.Cleanup(func() {
+		n.closeListener()
+		n.wg.Wait()
+	})
 
 	return n
 }
 
+// closeListener shuts the accept loop down; safe to call more than once.
+func (n *mockNSQD) closeListener() {
+	n.listenerCloseOnce.Do(func() {
+		n.tcpListener.Close()
+	})
+}
+
 func (n *mockNSQD) listen() {
+	defer n.wg.Done()
 	n.t.Logf("TCP: listening on %s", n.tcpListener.Addr())
 
 	for {
@@ -72,6 +101,7 @@ func (n *mockNSQD) listen() {
 		if err != nil {
 			break
 		}
+		n.wg.Add(1)
 		go n.handle(conn)
 	}
 
@@ -80,6 +110,7 @@ func (n *mockNSQD) listen() {
 }
 
 func (n *mockNSQD) handle(conn net.Conn) {
+	defer n.wg.Done()
 	var idx int
 
 	n.t.Logf("TCP: new client(%s)", conn.RemoteAddr())
@@ -113,7 +144,9 @@ func (n *mockNSQD) handle(conn net.Conn) {
 		select {
 		case line := <-readChan:
 			n.t.Logf("mock: %s", line)
+			n.gotMtx.Lock()
 			n.got = append(n.got, line)
+			n.gotMtx.Unlock()
 			params := bytes.Split(line, []byte(" "))
 			switch {
 			case bytes.Equal(params[0], []byte("IDENTIFY")):
@@ -136,6 +169,21 @@ func (n *mockNSQD) handle(conn net.Conn) {
 				rdyCount = rdy
 			case bytes.Equal(params[0], []byte("FIN")):
 			case bytes.Equal(params[0], []byte("REQ")):
+			case bytes.Equal(params[0], []byte("CLS")):
+				// ack the graceful close
+				_, err := conn.Write(framedResponse(FrameTypeResponse, []byte("CLOSE_WAIT")))
+				if err != nil {
+					n.t.Log(err)
+				}
+				readDoneChan <- 1
+				if n.holdAfterCloseWait {
+					// nsqd keeps the connection while in-flight work drains.
+					// Block on the raw connection (never the shared buffered
+					// reader, which the line-reader goroutine still owns)
+					// until the client tears the socket down.
+					io.Copy(io.Discard, conn)
+				}
+				goto exit
 			}
 			readDoneChan <- 1
 		case <-scriptTime:
@@ -162,7 +210,9 @@ func (n *mockNSQD) handle(conn net.Conn) {
 	}
 
 exit:
-	n.tcpListener.Close()
+	// shut the accept loop so listen() closes exitChan, then release this
+	// client; the test cleanup waits on the WaitGroup before teardown
+	n.closeListener()
 	conn.Close()
 }
 
@@ -189,6 +239,21 @@ func framedResponse(frameType int32, data []byte) []byte {
 }
 
 type testHandler struct{}
+
+// stopConsumerOnCleanup makes sure the consumer and all of its connection
+// goroutines wind down before the test (and its mock nsqd) are torn down, so
+// nothing logs from a detached goroutine after completion.
+func stopConsumerOnCleanup(t *testing.T, q *Consumer) {
+	t.Helper()
+	t.Cleanup(func() {
+		q.Stop()
+		select {
+		case <-q.StopChan:
+		case <-time.After(5 * time.Second):
+			t.Error("consumer did not stop cleanly")
+		}
+	})
+}
 
 func (h *testHandler) HandleMessage(message *Message) error {
 	switch string(message.Body) {
@@ -250,6 +315,7 @@ func TestConsumerBackoff(t *testing.T) {
 	if err != nil {
 		t.Fatalf(err.Error())
 	}
+	stopConsumerOnCleanup(t, q)
 
 	<-n.exitChan
 
@@ -321,6 +387,7 @@ func TestConsumerRequeueNoBackoff(t *testing.T) {
 	if err != nil {
 		t.Fatalf(err.Error())
 	}
+	stopConsumerOnCleanup(t, q)
 
 	select {
 	case <-n.exitChan:
@@ -391,6 +458,7 @@ func TestConsumerBackoffDisconnect(t *testing.T) {
 	if err != nil {
 		t.Fatalf(err.Error())
 	}
+	stopConsumerOnCleanup(t, q)
 
 	select {
 	case <-n.exitChan:
@@ -497,6 +565,7 @@ func TestConsumerPause(t *testing.T) {
 	if err != nil {
 		t.Fatalf(err.Error())
 	}
+	stopConsumerOnCleanup(t, q)
 
 	timeoutCh := time.After(500 * time.Millisecond)
 	pauseCh := time.After(50 * time.Millisecond)

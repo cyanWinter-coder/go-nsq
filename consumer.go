@@ -2,6 +2,7 @@ package nsq
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -137,6 +138,15 @@ type Consumer struct {
 	stopHandler     sync.Once
 	exitHandler     sync.Once
 
+	// tracks handlers that have begun processing a message so that shutdown
+	// can be bounded instead of waiting indefinitely
+	handlerWg sync.WaitGroup
+
+	// canceled once ShutdownTimeout elapses during Stop(); the context handed
+	// to delivered messages is derived from it
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
+
 	// read from this channel to block until consumer is cleanly stopped
 	StopChan chan int
 	exitChan chan int
@@ -183,6 +193,8 @@ func NewConsumer(topic string, channel string, config *Config) (*Consumer, error
 		StopChan: make(chan int),
 		exitChan: make(chan int),
 	}
+
+	r.stopCtx, r.stopCancel = context.WithCancel(context.Background())
 
 	// Set default logger for all log levels
 	l := log.New(os.Stderr, "", log.Flags())
@@ -678,6 +690,7 @@ func (r *Consumer) DisconnectFromNSQLookupd(addr string) error {
 
 func (r *Consumer) onConnMessage(c *Conn, msg *Message) {
 	atomic.AddUint64(&r.messagesReceived, 1)
+	msg.setContext(r.stopCtx)
 	r.incomingMessages <- msg
 }
 
@@ -800,6 +813,13 @@ func (r *Consumer) onConnClose(c *Conn) {
 }
 
 func (r *Consumer) startStopContinueBackoff(conn *Conn, signal backoffSignal) {
+	// once shutdown has begun a requeue from the server must not be allowed to
+	// re-arm RDY or schedule a backoff resume, otherwise it could restart the
+	// message flow we are trying to drain
+	if atomic.LoadInt32(&r.stopFlag) == 1 {
+		return
+	}
+
 	// prevent many async failures/successes from immediately resulting in
 	// max backoff/normal rate (by ensuring that we dont continually incr/decr
 	// the counter during a backoff period)
@@ -903,6 +923,10 @@ func (r *Consumer) inBackoffTimeout() bool {
 }
 
 func (r *Consumer) maybeUpdateRDY(conn *Conn) {
+	if atomic.LoadInt32(&r.stopFlag) == 1 {
+		return
+	}
+
 	inBackoff := r.inBackoff()
 	inBackoffTimeout := r.inBackoffTimeout()
 	if inBackoff || inBackoffTimeout {
@@ -938,6 +962,12 @@ exit:
 
 func (r *Consumer) updateRDY(c *Conn, count int64) error {
 	if c.IsClosing() {
+		return ErrClosing
+	}
+
+	// never re-arm RDY while shutting down; only the Stop() orchestration is
+	// allowed to drive RDY (to zero) past this point
+	if atomic.LoadInt32(&r.stopFlag) == 1 && count > 0 {
 		return ErrClosing
 	}
 
@@ -1002,6 +1032,10 @@ func (r *Consumer) sendRDY(c *Conn, count int64) error {
 }
 
 func (r *Consumer) redistributeRDY() {
+	if atomic.LoadInt32(&r.stopFlag) == 1 {
+		return
+	}
+
 	if r.inBackoffTimeout() {
 		return
 	}
@@ -1068,6 +1102,17 @@ func (r *Consumer) redistributeRDY() {
 
 // Stop will initiate a graceful stop of the Consumer (permanent)
 //
+// It first prevents any further message dispatch and revokes the unused RDY
+// count on every connection, then sends the protocol-level close and waits up
+// to the configured ShutdownTimeout for in-flight handlers to finish. If that
+// deadline elapses the handler context (see Message.Context) is canceled and
+// the connections are force closed; after a further ShutdownTimeout any handler
+// still stuck is abandoned, so Stop() is guaranteed to complete in bounded time.
+//
+// Stop is idempotent: repeated calls return the same final state observable via
+// StopChan. A stopped Consumer can not be restarted, and callbacks delivered
+// while shutting down can not re-arm its connections.
+//
 // NOTE: receive on StopChan to block until this process completes
 func (r *Consumer) Stop() {
 	if !atomic.CompareAndSwapInt32(&r.stopFlag, 0, 1) {
@@ -1076,24 +1121,98 @@ func (r *Consumer) Stop() {
 
 	r.log(LogLevelInfo, "stopping...")
 
-	if len(r.conns()) == 0 {
+	conns := r.conns()
+	if len(conns) == 0 {
 		r.stopHandlers()
-	} else {
-		for _, c := range r.conns() {
-			err := c.WriteCommand(StartClose())
-			if err != nil {
-				r.log(LogLevelError, "(%s) error sending CLS - %s", c.String(), err)
-			}
-		}
+		return
+	}
 
-		time.AfterFunc(time.Second*30, func() {
-			// if we've waited this long handlers are blocked on processing messages
-			// so we can't just stopHandlers (if any adtl. messages were pending processing
-			// we would cause a panic on channel close)
-			//
-			// instead, we just bypass handler closing and skip to the final exit
-			r.exit()
-		})
+	// 1. stop new dispatch first: revoke any RDY that has not been consumed by
+	// an in-flight message. This goes through sendRDY directly (bypassing the
+	// max-in-flight accounting in updateRDY, which refuses to raise RDY while
+	// shutting down) so the revoke can never fail with ErrOverMaxInFlight.
+	for _, c := range conns {
+		if c.IsClosing() || c.RDY() == 0 {
+			continue
+		}
+		r.log(LogLevelInfo, "(%s) revoking RDY %d on stop", c.String(), c.RDY())
+		if err := r.sendRDY(c, 0); err != nil {
+			r.log(LogLevelError, "(%s) error revoking RDY - %s", c.String(), err)
+		}
+	}
+
+	// 2. initiate the protocol-level graceful close of every connection
+	for _, c := range conns {
+		if err := c.WriteCommand(StartClose()); err != nil {
+			r.log(LogLevelError, "(%s) error sending CLS - %s", c.String(), err)
+		}
+	}
+
+	// 3. bound the wait for handlers that were already processing a message
+	go r.stopWatchdog(conns)
+}
+
+// stopWatchdog enforces the bounded portion of a graceful shutdown.
+//
+// It waits up to ShutdownTimeout for the handlers already processing a
+// message (tracked by handlerWg) to finish, but StopChan is the only success
+// signal so a handler that starts draining a queued message just after the
+// WaitGroup reaches zero is still covered by the deadline. The natural path
+// drives termination on its own: the last connection close calls
+// stopHandlers(), the drained handler loops call exit(), and exit() publishes
+// the final state exactly once (via exitHandler). This goroutine only
+// intervenes when that path stalls, so it can never publish a duplicate final
+// state.
+func (r *Consumer) stopWatchdog(conns []*Conn) {
+	shutdownTimeout := r.config.ShutdownTimeout
+
+	handlerDone := make(chan struct{})
+	go func() {
+		// wait for every handler that had started processing a message
+		r.handlerWg.Wait()
+		close(handlerDone)
+	}()
+
+	timer := time.NewTimer(shutdownTimeout)
+	defer timer.Stop()
+
+	// phase 1: give in-flight handlers up to the deadline to finish
+	select {
+	case <-r.StopChan:
+		return
+	case <-timer.C:
+	case <-handlerDone:
+		// the started handlers drained, but the connection/handler-loop
+		// teardown still has to publish StopChan; keep the deadline armed by
+		// disabling this case (a nil channel never fires)
+		handlerDone = nil
+		select {
+		case <-r.StopChan:
+			return
+		case <-timer.C:
+		}
+	}
+
+	// handlers blocked on processing did not finish in time: signal cooperative
+	// cancellation through the message context and force the connections closed
+	// so that their read/write loops and the in-flight message drain unwind
+	r.log(LogLevelWarning,
+		"shutdown timeout %s elapsed, canceling handler context and closing %d connections",
+		shutdownTimeout, len(conns))
+	r.stopCancel()
+	for _, c := range conns {
+		c.Close()
+	}
+
+	// phase 2: give context-aware handlers a further deadline to wind down;
+	// only if StopChan is still not published do we force the final state so
+	// that Stop() returns
+	timer.Reset(shutdownTimeout)
+	select {
+	case <-r.StopChan:
+	case <-timer.C:
+		r.log(LogLevelWarning, "handlers still in flight after %s, forcing exit", shutdownTimeout)
+		r.exit()
 	}
 }
 
@@ -1146,7 +1265,11 @@ func (r *Consumer) handlerLoop(handler Handler) {
 			continue
 		}
 
+		// account for a handler that has started processing so shutdown can
+		// wait for it (bounded by ShutdownTimeout) rather than racing its exit
+		r.handlerWg.Add(1)
 		err := handler.HandleMessage(message)
+		r.handlerWg.Done()
 		if err != nil {
 			r.log(LogLevelError, "Handler returned error (%s) for msg %s", err, message.ID)
 			if !message.IsAutoResponseDisabled() {

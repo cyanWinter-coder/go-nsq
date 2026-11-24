@@ -183,6 +183,12 @@ type Config struct {
 	// Maximum size of a single message in bytes (0 means no limit)
 	MaxMsgSize int32 `opt:"max_msg_size" min:"0" default:"0"`
 
+	// Maximum duration to wait for in-flight handlers to finish when Stop() is
+	// called. Once it elapses the handler context is canceled (see Message.Context)
+	// and connections are force closed; after a further ShutdownTimeout any
+	// handlers still stuck are abandoned so that Stop() is guaranteed to return.
+	ShutdownTimeout time.Duration `opt:"shutdown_timeout" min:"0" max:"60m" default:"30s"`
+
 	// Secret for nsqd authentication (requires nsqd 0.2.29+)
 	AuthSecret string `opt:"auth_secret"`
 	// Use AuthSecret as 'Authorization: Bearer {AuthSecret}' on lookupd queries

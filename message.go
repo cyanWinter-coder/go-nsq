@@ -1,6 +1,7 @@
 package nsq
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -26,6 +27,8 @@ type Message struct {
 
 	Delegate MessageDelegate
 
+	ctx context.Context
+
 	autoResponseDisabled int32
 	responded            int32
 }
@@ -37,6 +40,27 @@ func NewMessage(id MessageID, body []byte) *Message {
 		ID:        id,
 		Body:      body,
 		Timestamp: time.Now().UnixNano(),
+		ctx:       context.Background(),
+	}
+}
+
+// Context returns the context associated with this message.
+//
+// For messages delivered to a Consumer's handler the context is canceled once
+// the Consumer's configured ShutdownTimeout elapses during a graceful stop,
+// giving a long-running handler a cooperative way to observe that shutdown has
+// been requested. It defaults to context.Background() when none was attached.
+func (m *Message) Context() context.Context {
+	if m.ctx != nil {
+		return m.ctx
+	}
+	return context.Background()
+}
+
+// setContext attaches a context to the message (used by the Consumer)
+func (m *Message) setContext(ctx context.Context) {
+	if ctx != nil {
+		m.ctx = ctx
 	}
 }
 
