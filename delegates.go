@@ -51,11 +51,23 @@ type connMessageDelegate struct {
 	c *Conn
 }
 
-func (d *connMessageDelegate) OnFinish(m *Message) { d.c.onMessageFinish(m) }
+func (d *connMessageDelegate) OnFinish(m *Message) { _ = d.c.onMessageFinish(m) }
 func (d *connMessageDelegate) OnRequeue(m *Message, t time.Duration, b bool) {
-	d.c.onMessageRequeue(m, t, b)
+	_ = d.c.onMessageRequeue(m, t, b)
 }
-func (d *connMessageDelegate) OnTouch(m *Message) { d.c.onMessageTouch(m) }
+func (d *connMessageDelegate) OnTouch(m *Message) { _ = d.c.onMessageTouch(m) }
+
+func (d *connMessageDelegate) finishResponse(m *Message) error {
+	return d.c.onMessageFinish(m)
+}
+
+func (d *connMessageDelegate) requeueResponse(m *Message, t time.Duration, b bool) error {
+	return d.c.onMessageRequeue(m, t, b)
+}
+
+func (d *connMessageDelegate) touchResponse(m *Message) error {
+	return d.c.onMessageTouch(m)
+}
 
 // ConnDelegate is an interface of methods that are used as
 // callbacks in Conn
@@ -108,17 +120,21 @@ type consumerConnDelegate struct {
 	r *Consumer
 }
 
-func (d *consumerConnDelegate) OnResponse(c *Conn, data []byte)       { d.r.onConnResponse(c, data) }
-func (d *consumerConnDelegate) OnError(c *Conn, data []byte)          { d.r.onConnError(c, data) }
-func (d *consumerConnDelegate) OnMessage(c *Conn, m *Message)         { d.r.onConnMessage(c, m) }
-func (d *consumerConnDelegate) OnMessageFinished(c *Conn, m *Message) { d.r.onConnMessageFinished(c, m) }
-func (d *consumerConnDelegate) OnMessageRequeued(c *Conn, m *Message) { d.r.onConnMessageRequeued(c, m) }
-func (d *consumerConnDelegate) OnBackoff(c *Conn)                     { d.r.onConnBackoff(c) }
-func (d *consumerConnDelegate) OnContinue(c *Conn)                    { d.r.onConnContinue(c) }
-func (d *consumerConnDelegate) OnResume(c *Conn)                      { d.r.onConnResume(c) }
-func (d *consumerConnDelegate) OnIOError(c *Conn, err error)          { d.r.onConnIOError(c, err) }
-func (d *consumerConnDelegate) OnHeartbeat(c *Conn)                   { d.r.onConnHeartbeat(c) }
-func (d *consumerConnDelegate) OnClose(c *Conn)                       { d.r.onConnClose(c) }
+func (d *consumerConnDelegate) OnResponse(c *Conn, data []byte) { d.r.onConnResponse(c, data) }
+func (d *consumerConnDelegate) OnError(c *Conn, data []byte)    { d.r.onConnError(c, data) }
+func (d *consumerConnDelegate) OnMessage(c *Conn, m *Message)   { d.r.onConnMessage(c, m) }
+func (d *consumerConnDelegate) OnMessageFinished(c *Conn, m *Message) {
+	d.r.onConnMessageFinished(c, m)
+}
+func (d *consumerConnDelegate) OnMessageRequeued(c *Conn, m *Message) {
+	d.r.onConnMessageRequeued(c, m)
+}
+func (d *consumerConnDelegate) OnBackoff(c *Conn)            { d.r.onConnBackoff(c) }
+func (d *consumerConnDelegate) OnContinue(c *Conn)           { d.r.onConnContinue(c) }
+func (d *consumerConnDelegate) OnResume(c *Conn)             { d.r.onConnResume(c) }
+func (d *consumerConnDelegate) OnIOError(c *Conn, err error) { d.r.onConnIOError(c, err) }
+func (d *consumerConnDelegate) OnHeartbeat(c *Conn)          { d.r.onConnHeartbeat(c) }
+func (d *consumerConnDelegate) OnClose(c *Conn)              { d.r.onConnClose(c) }
 
 // keeps the exported Producer struct clean of the exported methods
 // required to implement the ConnDelegate interface
